@@ -375,3 +375,57 @@ class CargoReadings(BaseModel):
     cargo_id: str
     temp_upper_limit: Decimal
     readings: list[CargoReading]
+
+
+# ----------------------------------------------------- 整车交接
+
+
+class VehicleHandoverCreate(BaseModel):
+    """整车交接提交。
+
+    车次可在路径与请求体中同时给出（必须一致）；交接单号为客户端指定的
+    全局幂等键。交接时刻在车货物清单由服务端按装载时段左闭右开确定。
+    """
+
+    handover_id: str = Field(
+        ..., min_length=1, max_length=64, description="唯一交接单号（客户端指定，幂等键）"
+    )
+    trip_id: str = Field(..., min_length=1, max_length=64, description="车次编号")
+    handover_at: datetime = Field(
+        ..., description="交接时刻（ISO 8601，建议带时区）；按左闭右开确定在车清单"
+    )
+    giver: str = Field(..., min_length=1, max_length=128, description="交出方")
+    receiver: str = Field(..., min_length=1, max_length=128, description="接收方")
+
+
+class VehicleHandoverItemOut(BaseModel):
+    """交接单清单中的一票货物（写入时的装载时段快照 + 逐票交接事件编号）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    cargo_id: str
+    loaded_at: datetime = Field(..., description="交接单写入时该货物装载时段起点（含）")
+    unloaded_at: datetime = Field(..., description="交接单写入时该货物装载时段终点（不含）")
+    event_id: str = Field(..., description="为该票货物产生的普通交接事件编号")
+
+
+class VehicleHandoverOut(BaseModel):
+    """整车交接单（含不可变的在车货物清单快照与逐票事件编号）。"""
+
+    handover_id: str
+    trip_id: str
+    handover_at: datetime
+    giver: str
+    receiver: str
+    created_at: datetime
+    manifest: list[VehicleHandoverItemOut] = Field(
+        ..., description="交接时刻在车货物清单（快照，永久保留）"
+    )
+
+
+class VehicleHandoverReplay(BaseModel):
+    """同交接单号同内容重传：返回原交接单（不重复产生货物事件）。"""
+
+    replayed: bool = True
+    handover: VehicleHandoverOut
+    message: str

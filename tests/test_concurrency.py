@@ -7,6 +7,7 @@
 （默认的内存 StaticPool 配置下本用例自动跳过。）
 """
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
@@ -171,3 +172,135 @@ def test_concurrent_onboard_reading_and_event_serialize(client):
     at_11 = [r for r in readings if r["occurred_at"].startswith("2026-01-01T11:00:00")]
     adopted = [r for r in at_11 if r["adopted"]]
     assert len(adopted) == 1 and adopted[0]["source"] == "own"
+
+
+def test_concurrent_vehicle_handovers_serialize(client):
+    """整车交接并发：同车次同刻只有一笔成功（行锁 + 唯一约束兜底）。"""
+    for cid in ("CV1", "CV2"):
+        client.post(
+            "/cargo",
+            json={
+                "cargo_id": cid,
+                "started_at": "2026-01-01T10:00:00+00:00",
+                "temp_upper_limit": "5",
+                "initial_holder": "A",
+            },
+        )
+    client.post("/trips", json={"trip_id": "TV", "vehicle_no": "V"})
+    client.post(
+        "/trips/TV/loadings",
+        json={"loadings": [
+            {"cargo_id": "CV1",
+             "loaded_at": "2026-01-01T10:00:00+00:00",
+             "unloaded_at": "2026-01-01T12:00:00+00:00"},
+            {"cargo_id": "CV2",
+             "loaded_at": "2026-01-01T10:00:00+00:00",
+             "unloaded_at": "2026-01-01T12:00:00+00:00"},
+        ]},
+    )
+
+    def submit(i):
+        # 同刻多笔整车交接：第一笔 A->Pi 成功后，其余要么同刻冲突，
+        # 要么交出方不再是保管方（整单拒绝）；绝不允许第二笔落库
+        return client.post(
+            "/trips/TV/handovers",
+            json={
+                "handover_id": f"vh{i}",
+                "trip_id": "TV",
+                "handover_at": "2026-01-01T11:00:00+00:00",
+                "giver": "A",
+                "receiver": f"P{i}",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(submit, range(8)))
+
+    assert codes.count(201) == 1
+    assert all(c in (409, 422) for c in codes if c != 201)
+    # 每票货物只有一笔交接事件；两张交接单之外无新增
+    from app.database import SessionLocal
+    from app.models import Event, VehicleHandover
+
+    db = SessionLocal()
+    try:
+        assert db.query(VehicleHandover).count() == 1
+        assert db.query(Event).filter(
+            Event.cargo_id.in_(["CV1", "CV2"])
+        ).count() == 2
+    finally:
+        db.close()
+
+
+def test_concurrent_loading_freeze_races_handover(client):
+    """补登记装载与整车交接并发：二者都先锁车次行，结果必须自洽。
+
+    场景：G2 拟补登记 [10:30,11:30)（覆盖 11:00），整车交接在 11:00 完成。
+    串行化后只可能出现两种合法结局之一：
+    * 装载先提交：交接清单含 G2（G2 必须为合法在车货物，保管方也是 A）；
+    * 交接先提交：补登记被冻结拒绝（loading_manifest_frozen）。
+    """
+    for cid in ("CF1", "CF2"):
+        client.post(
+            "/cargo",
+            json={
+                "cargo_id": cid,
+                "started_at": "2026-01-01T10:00:00+00:00",
+                "temp_upper_limit": "5",
+                "initial_holder": "A",
+            },
+        )
+    client.post("/trips", json={"trip_id": "TF", "vehicle_no": "V"})
+    client.post(
+        "/trips/TF/loadings",
+        json={"loadings": [
+            {"cargo_id": "CF1",
+             "loaded_at": "2026-01-01T10:00:00+00:00",
+             "unloaded_at": "2026-01-01T12:00:00+00:00"},
+        ]},
+    )
+
+    barrier = Barrier(2)
+
+    def do_handover():
+        barrier.wait()
+        return client.post(
+            "/trips/TF/handovers",
+            json={
+                "handover_id": "vhf-1",
+                "trip_id": "TF",
+                "handover_at": "2026-01-01T11:00:00+00:00",
+                "giver": "A",
+                "receiver": "B",
+            },
+        )
+
+    def do_loading():
+        barrier.wait()
+        return client.post(
+            "/trips/TF/loadings",
+            json={"loadings": [
+                {"cargo_id": "CF2",
+                 "loaded_at": "2026-01-01T10:30:00+00:00",
+                 "unloaded_at": "2026-01-01T11:30:00+00:00"},
+            ]},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_h = pool.submit(do_handover)
+        f_l = pool.submit(do_loading)
+        h_resp = f_h.result()
+        l_resp = f_l.result()
+
+    assert h_resp.status_code == 201, h_resp.text
+    manifest = {m["cargo_id"] for m in h_resp.json()["manifest"]}
+    if l_resp.status_code == 201:
+        # 装载先到：交接清单必须包含 CF2
+        assert manifest == {"CF1", "CF2"}
+    else:
+        # 交接先到：补登记被冻结拒绝，清单只有 CF1
+        assert l_resp.status_code == 409
+        assert l_resp.json()["error"]["code"] == "loading_manifest_frozen"
+        assert manifest == {"CF1"}
+
+

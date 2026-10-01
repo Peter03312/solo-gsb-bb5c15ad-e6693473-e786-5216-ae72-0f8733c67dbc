@@ -125,3 +125,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_onboard_trip_time
 
 CREATE INDEX IF NOT EXISTS ix_onboard_trip
     ON onboard_reading (trip_id, read_at);
+
+-- 整车交接单（一次整车交接：车次 + 时刻 + 交出方 + 接收方 + 唯一单号）
+CREATE TABLE IF NOT EXISTS vehicle_handover (
+    handover_id   VARCHAR(64)   PRIMARY KEY,
+    trip_id       VARCHAR(64)   NOT NULL
+                     REFERENCES trip(trip_id) ON DELETE RESTRICT,
+    handover_at   TIMESTAMPTZ   NOT NULL,
+    giver         VARCHAR(128)  NOT NULL,
+    receiver      VARCHAR(128)  NOT NULL,
+    created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    -- 同一车次同一时刻至多一笔整车交接
+    CONSTRAINT ux_handover_trip_time UNIQUE (trip_id, handover_at)
+);
+
+CREATE INDEX IF NOT EXISTS ix_handover_trip
+    ON vehicle_handover (trip_id, handover_at);
+
+-- 整车交接单的在车货物清单快照（写入时按左闭右开确定，永久保留）；
+-- 每行同时记录为该票货物产生的普通交接事件ID
+CREATE TABLE IF NOT EXISTS vehicle_handover_item (
+    id            BIGSERIAL     PRIMARY KEY,
+    handover_id   VARCHAR(64)   NOT NULL
+                     REFERENCES vehicle_handover(handover_id) ON DELETE RESTRICT,
+    cargo_id      VARCHAR(64)   NOT NULL
+                     REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+    loaded_at     TIMESTAMPTZ   NOT NULL,
+    unloaded_at   TIMESTAMPTZ   NOT NULL,
+    event_id      VARCHAR(64)   NOT NULL
+                     REFERENCES event(event_id) ON DELETE RESTRICT,
+
+    -- 一张交接单内一票货物至多一条清单项
+    CONSTRAINT ux_handover_item_cargo UNIQUE (handover_id, cargo_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_handover_item_cargo
+    ON vehicle_handover_item (cargo_id);
+

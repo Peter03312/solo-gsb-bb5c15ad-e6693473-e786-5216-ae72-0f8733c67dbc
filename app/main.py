@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import crud, responsibility, stance_crud, timeline, trip_crud
+from app import crud, responsibility, stance_crud, timeline, trip_crud, handover_crud
 from app.database import Base, engine, get_db
 from app.models import Cargo, CargoLoading, Event, OnboardReading, Stance, StanceKind, Trip
 from app.schemas import (
@@ -43,6 +43,10 @@ from app.schemas import (
     TripCreate,
     TripDetail,
     TripOut,
+    VehicleHandoverCreate,
+    VehicleHandoverItemOut,
+    VehicleHandoverOut,
+    VehicleHandoverReplay,
 )
 from app.timeutil import ensure_utc
 
@@ -294,6 +298,105 @@ def list_onboard_readings(
         ).all()
     )
     return [_reading_schema(r) for r in rows]
+
+
+# ---------------------------------------------------------------- 整车交接
+
+
+def _handover_schema(result) -> VehicleHandoverOut:
+    hv = result.handover
+    return VehicleHandoverOut(
+        handover_id=hv.handover_id,
+        trip_id=hv.trip_id,
+        handover_at=ensure_utc(hv.handover_at),
+        giver=hv.giver,
+        receiver=hv.receiver,
+        created_at=ensure_utc(hv.created_at),
+        manifest=[
+            VehicleHandoverItemOut(
+                cargo_id=it.cargo_id,
+                loaded_at=ensure_utc(it.loaded_at),
+                unloaded_at=ensure_utc(it.unloaded_at),
+                event_id=it.event_id,
+            )
+            for it in result.items
+        ],
+    )
+
+
+@app.post(
+    "/trips/{trip_id}/handovers",
+    response_model=VehicleHandoverOut,
+    status_code=201,
+    tags=["整车交接"],
+    responses={
+        200: {"model": VehicleHandoverReplay, "description": "同交接单号同内容重传：返回原交接单"},
+        404: {"description": "车次不存在"},
+        409: {"description": "单号异内容冲突 / 同车次同刻已交接 / 清单冻结等"},
+        422: {"description": "空车 / 双方相同 / 保管方非交出方 / 同刻已有逐票交接 / 早于货物起始"},
+    },
+)
+def create_vehicle_handover(
+    trip_id: str,
+    payload: VehicleHandoverCreate,
+    db: Session = Depends(get_db),
+):
+    """整车交接：把交接时刻仍在车上的全部货物一次性从交出方交给接收方。
+
+    在车清单按装载时段左闭右开（``loaded_at <= 时刻 < unloaded_at``）确定；
+    空车、双方相同、任一货物该时刻保管方不是交出方、或同刻已有交接时整单拒绝，
+    **不产生任何货物事件**。成功后为清单内每票货物记一笔普通交接事件，
+    返回交接单（含不可变清单快照）与逐票事件编号。同单号同内容重传返回原结果。
+    """
+    if payload.trip_id != trip_id:
+        raise crud.ApiError(
+            422,
+            "bad_handover_shape",
+            f"路径车次 {trip_id} 与请求体车次 {payload.trip_id} 不一致",
+        )
+    result = handover_crud.create_vehicle_handover(db, payload)
+    body = _handover_schema(result)
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=VehicleHandoverReplay(
+                replayed=True,
+                handover=body,
+                message="相同内容的整车交接已存在，重传被忽略（幂等），返回原交接单与逐票事件编号",
+            ).model_dump(mode="json"),
+        )
+    return body
+
+
+@app.get(
+    "/handovers",
+    response_model=list[VehicleHandoverOut],
+    tags=["整车交接"],
+)
+def list_vehicle_handovers(
+    trip_id: str | None = None, db: Session = Depends(get_db)
+) -> list[VehicleHandoverOut]:
+    """整车交接单列表（按交接时刻升序）；可用 ``?trip_id=`` 仅查某车次。"""
+    if trip_id is not None and db.get(Trip, trip_id) is None:
+        raise crud.ApiError(404, "trip_not_found", f"车次 {trip_id} 不存在")
+    rows = handover_crud.list_vehicle_handovers(db, trip_id)
+    return [
+        _handover_schema(handover_crud.get_vehicle_handover(db, h.handover_id))
+        for h in rows
+    ]
+
+
+@app.get(
+    "/handovers/{handover_id}",
+    response_model=VehicleHandoverOut,
+    tags=["整车交接"],
+    responses={404: {"description": "交接单不存在"}},
+)
+def get_vehicle_handover(
+    handover_id: str, db: Session = Depends(get_db)
+) -> VehicleHandoverOut:
+    """查询整车交接单（含当时货物清单快照与逐票交接事件编号）。"""
+    return _handover_schema(handover_crud.get_vehicle_handover(db, handover_id))
 
 
 @app.get(

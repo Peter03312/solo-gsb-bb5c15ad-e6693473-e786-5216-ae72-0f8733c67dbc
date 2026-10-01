@@ -250,3 +250,79 @@ class OnboardReading(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class VehicleHandover(Base):
+    """一次整车交接单（操作员在某车次、某时刻把整车从交出方交给接收方）。
+
+    交接单在写入时即按装载时段左闭右开规则确定“该时刻在车货物清单”，
+    并把清单作为**不可变快照**保留（见 VehicleHandoverItem）。
+    成功后为清单内每票货物在 ``event`` 表记一笔普通交接事件——
+    整车交接不改变既有追责 / 责任模型，只是批量、原子地产生交接事件。
+
+    同一交接单号全局唯一（幂等键）；同一车次同一时刻至多一笔整车交接。
+    """
+
+    __tablename__ = "vehicle_handover"
+    __table_args__ = (
+        # 同一车次同一时刻至多一笔整车交接（“同刻已有交接”整单拒绝的库级兜底）
+        UniqueConstraint("trip_id", "handover_at", name="ux_handover_trip_time"),
+        Index("ix_handover_trip", "trip_id", "handover_at"),
+    )
+
+    handover_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    trip_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("trip.trip_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    handover_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    giver: Mapped[str] = mapped_column(String(128), nullable=False)
+    receiver: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class VehicleHandoverItem(Base):
+    """整车交接单清单中的一票货物快照（交接单不可变内容的一部分）。
+
+    每行对应：交接时刻该票货物按左闭右开规则确定的装载时段，
+    以及成功后为该票货物写入的那笔普通交接事件（``event_id``）。
+    后续即使有晚到数据，交接单返回的仍是这份快照。
+    """
+
+    __tablename__ = "vehicle_handover_item"
+    __table_args__ = (
+        UniqueConstraint("handover_id", "cargo_id", name="ux_handover_item_cargo"),
+        Index("ix_handover_item_cargo", "cargo_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    handover_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("vehicle_handover.handover_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    cargo_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    # 交接单写入时刻该票货物的装载时段快照（左闭右开）
+    loaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    unloaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # 为该票货物产生的普通交接事件ID（event 表主键）
+    event_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("event.event_id", ondelete="RESTRICT"),
+        nullable=False,
+    )

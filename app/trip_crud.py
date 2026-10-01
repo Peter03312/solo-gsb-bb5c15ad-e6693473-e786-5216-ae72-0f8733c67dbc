@@ -25,7 +25,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.crud import ApiError, _conflict
-from app.models import Cargo, CargoLoading, OnboardReading, Trip
+from app.models import (
+    Cargo,
+    CargoLoading,
+    OnboardReading,
+    Trip,
+    VehicleHandover,
+    VehicleHandoverItem,
+)
 from app.schemas import LoadingEntry, OnboardReadingCreate, TripCreate
 from app.timeutil import ensure_utc
 
@@ -74,6 +81,46 @@ def _load_cargos_locked_ordered(db, cargo_ids: list[str]) -> dict[str, Cargo]:
 def _windows_overlap(a_start, a_end, b_start, b_end) -> bool:
     """半开区间相交判定：首尾相接（a_end == b_start）不算相交。"""
     return a_start < b_end and b_start < a_end
+
+
+def _check_completed_handovers_unchanged(db, trip_id: str, normalized: dict) -> None:
+    """补登记装载不得改变任一已完成整车交接时刻的在车集合（清单冻结）。
+
+    已完成交接单永久保留写入时的在车清单快照。本批次新增的装载时段若按
+    左闭右开覆盖了该车次上某个已完成交接时刻，而该货物又不在该交接单
+    清单内，则该时刻的在车集合会被改变 -> 整批拒绝。
+
+    （清单内货物的重复 / 相交登记已在装载重叠校验中拒绝；
+    只检查本车次即可：某货物在其他车次的时段不可能在该车次上覆盖交接时刻。）
+    """
+    handovers = list(
+        db.scalars(
+            select(VehicleHandover).where(VehicleHandover.trip_id == trip_id)
+        ).all()
+    )
+    if not handovers:
+        return
+    for hv in handovers:
+        at = ensure_utc(hv.handover_at)
+        manifest_cargo_ids = {
+            row.cargo_id
+            for row in db.scalars(
+                select(VehicleHandoverItem).where(
+                    VehicleHandoverItem.handover_id == hv.handover_id
+                )
+            ).all()
+        }
+        for cid, (start, end) in normalized.items():
+            if cid in manifest_cargo_ids:
+                continue
+            if start <= at < end:
+                raise _conflict(
+                    f"货物 {cid} 的补登记装载时段 [{start.isoformat()}, "
+                    f"{end.isoformat()}) 会覆盖已完成交接单 {hv.handover_id} "
+                    f"（{at.isoformat()} 时刻），并改变该时刻的在车货物集合："
+                    "交接单保留当时清单，整批装载拒绝",
+                    code="loading_manifest_frozen",
+                )
 
 
 def register_loadings(db, trip_id: str, entries: list[LoadingEntry]) -> list[CargoLoading]:
@@ -147,6 +194,9 @@ def _register_loadings_tx(db, trip_id: str, entries: list[LoadingEntry]) -> list
                     code="loading_overlap",
                 )
 
+        # 交接单清单冻结：补登记装载不得改变任一已完成交接时刻的在车集合
+        _check_completed_handovers_unchanged(db, trip_id, normalized)
+
         # 批量内同一货物已在上面以 len(normalized) 校验过；不同货物时段互不影响。
 
         rows = [
@@ -195,8 +245,25 @@ def _same_reading_content(existing: OnboardReading, candidate: OnboardReading) -
 
 
 def _load_trip_locked(db, trip_id: str) -> Trip:
-    stmt = select(Trip).where(Trip.trip_id == trip_id).with_for_update()
-    trip = db.scalars(stmt).first()
+    """锁定车次行并返回车次（不存在 -> 404）。
+
+    * PostgreSQL：``SELECT ... FOR UPDATE`` 行级锁；
+    * SQLite：``FOR UPDATE`` 是空操作（无行锁），而该车次的装载 / 整车交接之间
+      存在“读后写”依赖（在车清单、清单冻结），仅靠唯一索引无法串行——
+      因此对 SQLite 用一行**无变化 UPDATE**（x=x）先取得该车次的写锁，
+      使并发的同类事务在 busy timeout 处排队，后执行者整体重试后读到新快照。
+      更新先于存在性检查，未命中时影响 0 行，再按 404 处理。
+    """
+    if db.bind.dialect.name == "sqlite":
+        db.execute(
+            Trip.__table__.update()
+            .where(Trip.trip_id == trip_id)
+            .values(vehicle_no=Trip.vehicle_no)
+        )
+        trip = db.get(Trip, trip_id)
+    else:
+        stmt = select(Trip).where(Trip.trip_id == trip_id).with_for_update()
+        trip = db.scalars(stmt).first()
     if trip is None:
         raise ApiError(404, "trip_not_found", f"车次 {trip_id} 不存在")
     return trip
