@@ -4,6 +4,7 @@
 为了便于本地测试，sqlite 内存库使用 StaticPool（同一连接共享内存数据库）。
 """
 import os
+import threading
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
@@ -34,8 +35,19 @@ if DATABASE_URL.startswith("sqlite"):
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA busy_timeout=10000")
             cur.close()
+
+    # SQLite 没有真正的行级锁，隔离语义也弱于 PostgreSQL（并发事务可能读到
+    # 其他连接已写入但未提交的“幻影”行）。用一把进程内可重入锁把所有写事务
+    # 串行化，作为 SQLite（内存/文件库、测试）适配；PostgreSQL 不使用此锁，
+    # 生产环境仍由 SELECT ... FOR UPDATE 的车次 / 货物行锁串行化。
+    sqlite_write_lock = threading.RLock()
 else:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
+    import contextlib
+
+    # PostgreSQL：生产路径由数据库行锁串行化，此对象仅保持导入一致（空上下文）
+    sqlite_write_lock = contextlib.nullcontext()
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 

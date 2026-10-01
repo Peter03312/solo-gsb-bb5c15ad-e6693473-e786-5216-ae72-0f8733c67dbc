@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app import chain
+from app.database import sqlite_write_lock
 from app.models import Cargo, Event, EventType
 from app.schemas import CargoCreate, EventCreate
 from app.timeutil import ensure_utc
@@ -48,27 +49,28 @@ class WriteResult:
 
 
 def create_cargo(db, payload: CargoCreate) -> Cargo:
-    existing = db.get(Cargo, payload.cargo_id)
-    if existing is not None:
-        raise _conflict(
-            f"货物编号 {payload.cargo_id} 已存在", code="cargo_exists"
+    with sqlite_write_lock:
+        existing = db.get(Cargo, payload.cargo_id)
+        if existing is not None:
+            raise _conflict(
+                f"货物编号 {payload.cargo_id} 已存在", code="cargo_exists"
+            )
+        cargo = Cargo(
+            cargo_id=payload.cargo_id,
+            started_at=payload.started_at,
+            temp_upper_limit=payload.temp_upper_limit,
+            initial_holder=payload.initial_holder,
         )
-    cargo = Cargo(
-        cargo_id=payload.cargo_id,
-        started_at=payload.started_at,
-        temp_upper_limit=payload.temp_upper_limit,
-        initial_holder=payload.initial_holder,
-    )
-    db.add(cargo)
-    try:
-        # expire_on_commit=False：提交后直接返回内存对象，无需额外查询
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise _conflict(
-            f"货物编号 {payload.cargo_id} 已存在", code="cargo_exists"
-        )
-    return cargo
+        db.add(cargo)
+        try:
+            # expire_on_commit=False：提交后直接返回内存对象，无需额外查询
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise _conflict(
+                f"货物编号 {payload.cargo_id} 已存在", code="cargo_exists"
+            )
+        return cargo
 
 
 def _load_cargo_locked(db, cargo_id: str) -> Cargo:
@@ -141,6 +143,12 @@ def _validate_prospective(cargo: Cargo, events: list[Event]) -> None:
 
 
 def create_event(db, payload: EventCreate) -> WriteResult:
+    # SQLite 适配：进程内写锁串行化；PostgreSQL 下为空上下文，行锁串行
+    with sqlite_write_lock:
+        return _create_event(db, payload)
+
+
+def _create_event(db, payload: EventCreate) -> WriteResult:
     try:
         etype = payload.event_type()
     except ValueError as exc:

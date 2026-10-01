@@ -375,3 +375,64 @@ class CargoReadings(BaseModel):
     cargo_id: str
     temp_upper_limit: Decimal
     readings: list[CargoReading]
+
+
+# ----------------------------------------------------- 整车交接
+
+
+class VehicleHandoverCreate(BaseModel):
+    """整车交接提交。
+
+    操作员提交车次、交接时刻、交出方、接收方及唯一交接单号；
+    在车货物清单由服务端按各货物在该车次上的装载时段（左闭右开）确定，
+    不由客户端提供。
+    """
+
+    handover_id: str = Field(
+        ..., min_length=1, max_length=64, description="唯一交接单号（客户端指定，全局唯一）"
+    )
+    trip_id: str = Field(..., min_length=1, max_length=64, description="车次编号")
+    handed_over_at: datetime = Field(
+        ..., description="交接时刻（ISO 8601，建议带时区）"
+    )
+    giver: str = Field(
+        ..., min_length=1, max_length=128, description="交出方（交接时刻在车各票货物的保管方）"
+    )
+    receiver: str = Field(
+        ..., min_length=1, max_length=128, description="接收方（不得与交出方相同）"
+    )
+
+
+class VehicleHandoverItemOut(BaseModel):
+    """交接单冻结清单中的一票货物及其派生的普通交接事件编号。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    cargo_id: str
+    event_id: str = Field(
+        ..., description="为本票货物写入的普通交接事件编号（可经 /events 既有接口查询）"
+    )
+
+
+class VehicleHandoverOut(BaseModel):
+    """整车交接单（含当时在车货物清单与逐票交接事件编号）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    handover_id: str
+    trip_id: str
+    handed_over_at: datetime
+    giver: str
+    receiver: str
+    created_at: datetime
+    manifest: list[VehicleHandoverItemOut] = Field(
+        ..., description="交接时冻结的在车货物清单（左闭右开确定）及逐票交接事件编号"
+    )
+
+
+class VehicleHandoverReplay(BaseModel):
+    """同交接单号同内容重传：返回原交接单，不重复产生任何货物事件。"""
+
+    replayed: bool = True
+    handover: VehicleHandoverOut
+    message: str

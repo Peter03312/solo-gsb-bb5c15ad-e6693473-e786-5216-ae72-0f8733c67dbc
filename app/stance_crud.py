@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from app import responsibility as resp
 from app import timeline
 from app.crud import ApiError, _load_cargo_locked
+from app.database import sqlite_write_lock
 from app.models import Stance, StanceKind
 from app.schemas import StanceCreate
 
@@ -124,13 +125,15 @@ def _same_stance_content(
 
 def submit_stance(db, cargo_id: str, interval_id: str, payload: StanceCreate) -> StanceWriteResult:
     kind = _parse_kind(payload)
-    # SQLite 文件库无行级锁，极端并发下 busy timeout 耗尽会抛 OperationalError，
-    # 整体重试一次即可（行锁/快照校验全部重来，语义不变）；PG 不会触发。
-    try:
-        return _submit_stance_tx(db, cargo_id, interval_id, payload, kind)
-    except OperationalError:
-        db.rollback()
-        return _submit_stance_tx(db, cargo_id, interval_id, payload, kind)
+    # SQLite 适配：进程内写锁串行化；PostgreSQL 下为空上下文，行锁串行
+    with sqlite_write_lock:
+        # SQLite 文件库无行级锁，极端并发下 busy timeout 耗尽会抛 OperationalError，
+        # 整体重试一次即可（行锁/快照校验全部重来，语义不变）；PG 不会触发。
+        try:
+            return _submit_stance_tx(db, cargo_id, interval_id, payload, kind)
+        except OperationalError:
+            db.rollback()
+            return _submit_stance_tx(db, cargo_id, interval_id, payload, kind)
 
 
 def _submit_stance_tx(db, cargo_id: str, interval_id: str, payload: StanceCreate, kind) -> StanceWriteResult:

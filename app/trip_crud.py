@@ -9,7 +9,9 @@
      车载读数写入互斥；
   2. 车次与货物必须存在；时段必须左闭右开（loaded_at < unloaded_at）；
   3. 同货物的新旧时段两两不得相交（首尾相接允许）；批量内部也不得自相交；
-  4. 任一校验失败整体回滚，不留部分记录。
+  4. 新时段不得改变任一**已完成整车交接时刻**的在车货物清单
+     （交接单冻结当时清单，见 app/handover_crud.py）；
+  5. 任一校验失败整体回滚，不留部分记录。
 * **写入车载读数**：
   1. 先锁车次行，再按货物编号排序锁定“读数时刻仍在车上”的货物行
      ——车载读数写入与这些货物的事件写入、责任表态、装载时段写入严格串行；
@@ -25,7 +27,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.crud import ApiError, _conflict
-from app.models import Cargo, CargoLoading, OnboardReading, Trip
+from app.database import sqlite_write_lock
+from app.models import (
+    Cargo,
+    CargoLoading,
+    OnboardReading,
+    Trip,
+    VehicleHandover,
+    VehicleHandoverItem,
+)
 from app.schemas import LoadingEntry, OnboardReadingCreate, TripCreate
 from app.timeutil import ensure_utc
 
@@ -38,21 +48,22 @@ def _unprocessable(message: str, code: str) -> ApiError:
 
 
 def create_trip(db, payload: TripCreate) -> Trip:
-    existing = db.get(Trip, payload.trip_id)
-    if existing is not None:
-        raise _conflict(f"车次编号 {payload.trip_id} 已存在", code="trip_exists")
-    trip = Trip(
-        trip_id=payload.trip_id,
-        vehicle_no=payload.vehicle_no,
-        note=payload.note,
-    )
-    db.add(trip)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise _conflict(f"车次编号 {payload.trip_id} 已存在", code="trip_exists")
-    return trip
+    with sqlite_write_lock:
+        existing = db.get(Trip, payload.trip_id)
+        if existing is not None:
+            raise _conflict(f"车次编号 {payload.trip_id} 已存在", code="trip_exists")
+        trip = Trip(
+            trip_id=payload.trip_id,
+            vehicle_no=payload.vehicle_no,
+            note=payload.note,
+        )
+        db.add(trip)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise _conflict(f"车次编号 {payload.trip_id} 已存在", code="trip_exists")
+        return trip
 
 
 # ----------------------------------------------------------- 装载时段
@@ -76,13 +87,78 @@ def _windows_overlap(a_start, a_end, b_start, b_end) -> bool:
     return a_start < b_end and b_start < a_end
 
 
+def _check_completed_handovers_frozen(
+    db, trip_id: str, normalized: dict[str, tuple]
+) -> None:
+    """补登记装载不得改变任一**已完成整车交接时刻**的在车集合。
+
+    整车交接单保留了交接当时的货物清单；本批次新时段若使某历史交接时刻的
+    在车货物集合（按装载时段左闭右开重算）与冻结清单不一致，整批拒绝
+    （409 handover_manifest_conflict）。仅检查本车次的交接单——清单按车次
+    冻结，其他车次的交接时刻不受本车次新时段影响。
+    """
+    handovers = list(
+        db.scalars(
+            select(VehicleHandover).where(VehicleHandover.trip_id == trip_id)
+        ).all()
+    )
+    if not handovers:
+        return
+
+    # 当前装载时段（同车次），时间归一化
+    current = list(
+        db.scalars(
+            select(CargoLoading).where(CargoLoading.trip_id == trip_id)
+        ).all()
+    )
+    windows: dict[str, tuple] = {
+        row.cargo_id: (ensure_utc(row.loaded_at), ensure_utc(row.unloaded_at))
+        for row in current
+    }
+    # 含本批次拟新增时段
+    prospective = dict(windows)
+    prospective.update(normalized)
+
+    for h in handovers:
+        at = ensure_utc(h.handed_over_at)
+        frozen = {
+            row.cargo_id
+            for row in db.scalars(
+                select(VehicleHandoverItem).where(
+                    VehicleHandoverItem.handover_id == h.handover_id
+                )
+            ).all()
+        }
+        prospective_on_board = {
+            cid
+            for cid, (start, end) in prospective.items()
+            if start <= at < end
+        }
+        if prospective_on_board != frozen:
+            added = sorted(prospective_on_board - frozen)
+            removed = sorted(frozen - prospective_on_board)
+            changes = []
+            if added:
+                changes.append(f"新增在车：{'、'.join(added)}")
+            if removed:
+                changes.append(f"在车集合缺少：{'、'.join(removed)}")
+            raise _conflict(
+                f"本批装载会改变已完成交接单 {h.handover_id}（车次 {trip_id}，"
+                f"交接时刻 {at.isoformat()}）的在车货物清单（{'；'.join(changes)}）："
+                "交接单保留当时清单，整批拒绝",
+                code="handover_manifest_conflict",
+            )
+
+
 def register_loadings(db, trip_id: str, entries: list[LoadingEntry]) -> list[CargoLoading]:
-    try:
-        return _register_loadings_tx(db, trip_id, entries)
-    except OperationalError:
-        # SQLite 文件库无行级锁，busy timeout 耗尽时整体重试一次
-        db.rollback()
-        return _register_loadings_tx(db, trip_id, entries)
+    # SQLite 适配：进程内写锁串行化；PostgreSQL 下为空上下文，行锁串行
+    with sqlite_write_lock:
+        try:
+            return _register_loadings_tx(db, trip_id, entries)
+        except OperationalError:
+            # SQLite 文件库无行级锁，busy timeout 耗尽时整体重试一次
+            db.rollback()
+            return _register_loadings_tx(db, trip_id, entries)
 
 
 def _register_loadings_tx(db, trip_id: str, entries: list[LoadingEntry]) -> list[CargoLoading]:
@@ -148,6 +224,9 @@ def _register_loadings_tx(db, trip_id: str, entries: list[LoadingEntry]) -> list
                 )
 
         # 批量内同一货物已在上面以 len(normalized) 校验过；不同货物时段互不影响。
+
+        # 已完成整车交接的清单冻结：本批时段不得改变任一历史交接时刻的在车集合
+        _check_completed_handovers_frozen(db, trip_id, normalized)
 
         rows = [
             CargoLoading(
@@ -221,11 +300,13 @@ def create_reading(db, payload: OnboardReadingCreate) -> ReadingWriteResult:
         read_at=read_at,
         temperature=payload.temperature,
     )
-    try:
-        return _create_reading_tx(db, candidate)
-    except OperationalError:
-        db.rollback()
-        return _create_reading_tx(db, candidate)
+    # SQLite 适配：进程内写锁串行化；PostgreSQL 下为空上下文，行锁串行
+    with sqlite_write_lock:
+        try:
+            return _create_reading_tx(db, candidate)
+        except OperationalError:
+            db.rollback()
+            return _create_reading_tx(db, candidate)
 
 
 def _create_reading_tx(db, candidate: OnboardReading) -> ReadingWriteResult:

@@ -16,6 +16,116 @@ def show(title: str, resp: httpx.Response) -> None:
     print(resp.text)
 
 
+def demo_vehicle_handover(api: httpx.Client) -> None:
+    """整车交接链路：在车清单自动确定、逐票事件、整单拒绝、幂等、清单冻结。"""
+    trip = "PY-TRIP-HO"
+    c1, c2 = "PY-HO-CARGO-1", "PY-HO-CARGO-2"
+    for cid, limit in ((c1, "4.0"), (c2, "7.0")):
+        show(
+            f"创建货物 {cid}",
+            api.post(
+                "/cargo",
+                json={
+                    "cargo_id": cid,
+                    "started_at": "2026-10-01T08:00:00+08:00",
+                    "temp_upper_limit": limit,
+                    "initial_holder": "北京冷库",
+                },
+            ),
+        )
+    show("登记车次", api.post("/trips", json={"trip_id": trip, "vehicle_no": "京A·P0001"}))
+    show(
+        "登记装载（左闭右开）",
+        api.post(
+            f"/trips/{trip}/loadings",
+            json={
+                "loadings": [
+                    {
+                        "cargo_id": c1,
+                        "loaded_at": "2026-10-01T10:00:00+08:00",
+                        "unloaded_at": "2026-10-01T18:00:00+08:00",
+                    },
+                    {
+                        "cargo_id": c2,
+                        "loaded_at": "2026-10-01T11:00:00+08:00",
+                        "unloaded_at": "2026-10-01T17:00:00+08:00",
+                    },
+                ]
+            },
+        ),
+    )
+    body = {
+        "handover_id": "PY-HO-1",
+        "trip_id": trip,
+        "handed_over_at": "2026-10-01T12:00:00+08:00",
+        "giver": "北京冷库",
+        "receiver": "济南冷库",
+    }
+    show("整车交接 12:00（清单=C1,C2，逐票返回普通交接事件编号）",
+         api.post(f"/trips/{trip}/handovers", json=body))
+    show("同单号同内容重传 -> 200 replayed（返回原交接单/原事件编号）",
+         api.post(f"/trips/{trip}/handovers", json=body))
+    show(
+        "同单号异内容 -> 409 handover_id_conflict",
+        api.post(
+            f"/trips/{trip}/handovers",
+            json={**body, "receiver": "青岛冷库"},
+        ),
+    )
+    show(
+        "双方相同 -> 422 bad_handover_shape",
+        api.post(
+            f"/trips/{trip}/handovers",
+            json={**body, "handover_id": "PY-HO-BAD", "receiver": "北京冷库"},
+        ),
+    )
+    show(
+        "保管方不符 -> 422 giver_mismatch（12:30 保管方已是济南冷库）",
+        api.post(
+            f"/trips/{trip}/handovers",
+            json={
+                "handover_id": "PY-HO-BAD2",
+                "trip_id": trip,
+                "handed_over_at": "2026-10-01T12:30:00+08:00",
+                "giver": "北京冷库",
+                "receiver": "青岛冷库",
+            },
+        ),
+    )
+    show(
+        "补登记装载改变 12:00 在车集合 -> 409 handover_manifest_conflict",
+        api.post(
+            "/cargo",
+            json={
+                "cargo_id": "PY-HO-CARGO-NEW",
+                "started_at": "2026-10-01T08:00:00+08:00",
+                "temp_upper_limit": "4.0",
+                "initial_holder": "北京冷库",
+            },
+        ),
+    )
+    show(
+        "补登记装载改变 12:00 在车集合 -> 409 handover_manifest_conflict",
+        api.post(
+            f"/trips/{trip}/loadings",
+            json={
+                "loadings": [
+                    {
+                        "cargo_id": "PY-HO-CARGO-NEW",
+                        "loaded_at": "2026-10-01T11:30:00+08:00",
+                        "unloaded_at": "2026-10-01T12:30:00+08:00",
+                    }
+                ]
+            },
+        ),
+    )
+    show("车次交接单列表", api.get(f"/trips/{trip}/handovers"))
+    show("按单号直查交接单（冻结清单 + 逐票事件编号）",
+         api.get("/handovers/PY-HO-1"))
+    show("既有事件接口兼容：C1 事件列表含派生的普通交接事件",
+         api.get(f"/cargo/{c1}/events"))
+
+
 def main() -> None:
     with httpx.Client(base_url=BASE, timeout=10) as api:
         show(
@@ -189,6 +299,9 @@ def main() -> None:
             "最终区间视图（汇总 all_confirmed）",
             api.get(f"/cargo/{CARGO}/responsibilities/{iid}"),
         )
+
+        # —— 整车交接链路（本轮新增）——
+        demo_vehicle_handover(api)
 
 
 if __name__ == "__main__":
